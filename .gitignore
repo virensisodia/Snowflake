@@ -1,0 +1,6 @@
+# Never commit Snowflake credentials
+*.p8
+*.pem
+*.key
+connections.toml
+.env

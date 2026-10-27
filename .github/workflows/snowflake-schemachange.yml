@@ -1,0 +1,113 @@
+name: Snowflake CI/CD (schemachange)
+
+# Pull requests -> dry run (shows what WOULD be deployed, changes nothing)
+# Push to main  -> real deploy
+# Manual run    -> pick dry run or deploy from the Actions tab
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "migrations/**"
+      - ".github/workflows/snowflake-schemachange.yml"
+  push:
+    branches: [main]
+    paths:
+      - "migrations/**"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run only (no changes applied)"
+        type: boolean
+        default: true
+
+# Never let two deployments run against the same database at once
+concurrency:
+  group: schemachange-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.11"
+  SCHEMACHANGE_VERSION: "4.*"
+  ROOT_FOLDER: "migrations"
+  # Table where schemachange records which scripts have already run
+  CHANGE_HISTORY_TABLE: "CICD_DEMO_DB.SCHEMACHANGE.CHANGE_HISTORY"
+
+jobs:
+  schemachange:
+    runs-on: ubuntu-latest
+    # Create an environment called "production" in GitHub (Settings > Environments)
+    # and add required reviewers there if you want a manual approval before deploys.
+    environment: ${{ github.event_name == 'pull_request' && 'ci' || 'production' }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install schemachange
+        run: |
+          python -m pip install --upgrade pip
+          pip install "schemachange==${SCHEMACHANGE_VERSION}"
+          schemachange --version || pip show schemachange
+
+      - name: Write Snowflake connection (key-pair auth)
+        env:
+          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
+          SNOWFLAKE_ROLE: ${{ secrets.SNOWFLAKE_ROLE }}
+          SNOWFLAKE_WAREHOUSE: ${{ secrets.SNOWFLAKE_WAREHOUSE }}
+          SNOWFLAKE_DATABASE: ${{ secrets.SNOWFLAKE_DATABASE }}
+          SNOWFLAKE_PRIVATE_KEY: ${{ secrets.SNOWFLAKE_PRIVATE_KEY }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/sf"
+          printf '%s\n' "$SNOWFLAKE_PRIVATE_KEY" > "$RUNNER_TEMP/sf/rsa_key.p8"
+          chmod 600 "$RUNNER_TEMP/sf/rsa_key.p8"
+
+          cat > "$RUNNER_TEMP/sf/connections.toml" <<EOF
+          [cicd]
+          account = "${SNOWFLAKE_ACCOUNT}"
+          user = "${SNOWFLAKE_USER}"
+          role = "${SNOWFLAKE_ROLE}"
+          warehouse = "${SNOWFLAKE_WAREHOUSE}"
+          database = "${SNOWFLAKE_DATABASE}"
+          authenticator = "SNOWFLAKE_JWT"
+          private_key_file = "${RUNNER_TEMP}/sf/rsa_key.p8"
+          EOF
+          chmod 600 "$RUNNER_TEMP/sf/connections.toml"
+
+      - name: Decide run mode
+        id: mode
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "flag=--dry-run" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.dry_run }}" = "true" ]; then
+            echo "flag=--dry-run" >> "$GITHUB_OUTPUT"
+          else
+            echo "flag=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run schemachange
+        env:
+          # Only needed if your key is encrypted; leave the secret unset otherwise
+          SNOWFLAKE_PRIVATE_KEY_PASSPHRASE: ${{ secrets.SNOWFLAKE_PRIVATE_KEY_PASSPHRASE }}
+        run: |
+          schemachange deploy \
+            --root-folder "$ROOT_FOLDER" \
+            --connections-file-path "$RUNNER_TEMP/sf/connections.toml" \
+            --connection-name cicd \
+            --change-history-table "$CHANGE_HISTORY_TABLE" \
+            --create-change-history-table \
+            --vars '{"env": "${{ github.event_name == 'pull_request' && 'ci' || 'prod' }}"}' \
+            ${{ steps.mode.outputs.flag }} \
+            -v
+
+      - name: Remove credentials
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/sf"
